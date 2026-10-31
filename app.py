@@ -23,36 +23,59 @@ from pydantic import BaseModel, Field
 
 # ================= CONFIGURATION =================
 
-# Local development: keep the SQLite database beside app.py.
-# Vercel: use /tmp because the deployed project directory is read-only.
-# IMPORTANT: Vercel /tmp storage is temporary and is not persistent.
 BASE_DIR = Path(__file__).resolve().parent
-if os.getenv("VERCEL"):
-    DATABASE_FILE = Path("/tmp/bizflow.db")
-else:
-    DATABASE_FILE = BASE_DIR / "bizflow.db"
+IS_VERCEL = os.getenv("VERCEL", "").lower() in {"1", "true"}
 
-DATABASE_URL = f"sqlite:///{DATABASE_FILE.as_posix()}"
+# Vercel is serverless: SQLite files there are temporary and can disappear.
+# Require a persistent database URL in production instead of silently using /tmp.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    if IS_VERCEL:
+        raise RuntimeError(
+            "DATABASE_URL is missing. Add your persistent PostgreSQL connection "
+            "string in Vercel Environment Variables. SQLite on Vercel is not persistent."
+        )
+    DATABASE_URL = f"sqlite:///{(BASE_DIR / 'bizflow.db').as_posix()}"
 
-# Never write secret files into the deployed project directory.
-# Set SECRET_KEY in Vercel Environment Variables for stable sessions.
-SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_urlsafe(48)
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ahmed123")
+# Support Neon/Render/Supabase PostgreSQL connection-string formats.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql+psycopg2://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
 
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    pool_pre_ping=True
+    connect_args={"check_same_thread": False} if IS_SQLITE else {},
+    pool_pre_ping=True,
+    pool_recycle=300 if not IS_SQLITE else -1
 )
 
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine
+    bind=engine,
+    expire_on_commit=False
 )
 
 Base = declarative_base()
+
+# Use a stable, random value from the hosting environment in production.
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    if IS_VERCEL:
+        raise RuntimeError("SECRET_KEY is missing. Add a long random SECRET_KEY in Vercel.")
+    SECRET_KEY = secrets.token_urlsafe(48)
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+if not ADMIN_PASSWORD:
+    if IS_VERCEL:
+        raise RuntimeError("ADMIN_PASSWORD is missing. Set it in Vercel Environment Variables.")
+    ADMIN_PASSWORD = "ChangeThisPassword123!"
+
 
 # ================= DATABASE MODELS =================
 
@@ -167,11 +190,10 @@ def verify_password(password, stored):
 def initialize_admin():
     db = SessionLocal()
     try:
-        user = db.query(User).filter(
-            User.username == ADMIN_USERNAME
-        ).first()
-
-        if not user:
+        # Create the initial admin only for a brand-new database.
+        # Do not recreate the environment-default admin after the owner changes
+        # their username from the Settings page.
+        if db.query(User).count() == 0:
             db.add(User(
                 username=ADMIN_USERNAME,
                 password_hash=hash_password(ADMIN_PASSWORD)
@@ -189,7 +211,7 @@ initialize_admin()
 app = FastAPI(
     title="BizFlow 360",
     description="Business Management Platform",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -359,14 +381,21 @@ def dashboard(
         Order.created_at.desc()
     ).limit(5).all()
 
+    if IS_SQLITE:
+        month_expression = func.strftime("%Y-%m", Order.created_at)
+    else:
+        month_expression = func.to_char(Order.created_at, "YYYY-MM")
+
     monthly = db.query(
-        func.strftime("%Y-%m", Order.created_at),
+        month_expression,
         func.sum(Order.total)
     ).filter(
         Order.status != "Cancelled"
     ).group_by(
-        func.strftime("%Y-%m", Order.created_at)
-    ).all() if DATABASE_URL.startswith("sqlite") else []
+        month_expression
+    ).order_by(
+        month_expression
+    ).all()
 
     return {
         "customers": customers,
