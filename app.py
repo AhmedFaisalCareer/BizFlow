@@ -36,6 +36,11 @@ engine = create_engine(
     pool_pre_ping=True
 )
 
+# SQLite journal mode helps protect local data during normal app use.
+with engine.connect() as connection:
+    connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
@@ -57,7 +62,8 @@ if not SECRET_KEY:
     SECRET_FILE.write_text(SECRET_KEY, encoding="utf-8")
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "ChangeThisPassword123!"
+ADMIN_PASSWORD = "ahmed123"
+LEGACY_ADMIN_PASSWORD = "ChangeThisPassword123!"
 
 
 # ================= DATABASE MODELS =================
@@ -173,15 +179,26 @@ def verify_password(password, stored):
 def initialize_admin():
     db = SessionLocal()
     try:
-        # Create the initial admin only for a brand-new database.
-        # Do not recreate the environment-default admin after the owner changes
-        # their username from the Settings page.
-        if db.query(User).count() == 0:
+        # Create the initial account only when this is a brand-new database.
+        # If this app was previously run with the old starter password, update
+        # that untouched starter account to the requested password once.
+        user_count = db.query(User).count()
+
+        if user_count == 0:
             db.add(User(
                 username=ADMIN_USERNAME,
                 password_hash=hash_password(ADMIN_PASSWORD)
             ))
             db.commit()
+        else:
+            starter_user = db.query(User).filter(
+                User.username == ADMIN_USERNAME
+            ).first()
+            if starter_user and verify_password(
+                LEGACY_ADMIN_PASSWORD, starter_user.password_hash
+            ):
+                starter_user.password_hash = hash_password(ADMIN_PASSWORD)
+                db.commit()
     finally:
         db.close()
 
@@ -194,7 +211,7 @@ initialize_admin()
 app = FastAPI(
     title="BizFlow 360",
     description="Business Management Platform",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -1009,7 +1026,7 @@ td{padding:15px;font-size:12px;border-bottom:1px solid #202638}
     <div class="card">
         <div class="card-heading"><h3>📊 System Information</h3></div>
         <p class="stat-title">Application: BizFlow 360</p>
-        <p class="stat-title">Version: 1.1.0</p>
+        <p class="stat-title">Version: 1.2.0</p>
         <p class="stat-title">Database: SQLite (Local Computer)</p>
         <p class="stat-title">Total Customers: <b id="sysCustomers">0</b></p>
         <p class="stat-title">Total Products: <b id="sysProducts">0</b></p>
