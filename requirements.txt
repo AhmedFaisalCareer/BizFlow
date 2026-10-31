@@ -1,5 +1,3 @@
 fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-itsdangerous
+uvicorn
+python-multipart
