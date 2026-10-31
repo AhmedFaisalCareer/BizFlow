@@ -4,7 +4,6 @@ import json
 import hmac
 import hashlib
 import secrets
-from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
 
@@ -23,47 +22,41 @@ from pydantic import BaseModel, Field
 
 # ================= CONFIGURATION =================
 
-# All application data is stored locally beside this app.py file.
-# No external database, cloud database, or environment DATABASE_URL is used.
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_FILE = BASE_DIR / "bizflow.db"
-DATABASE_URL = f"sqlite:///{DATABASE_FILE.as_posix()}"
-IS_SQLITE = True
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bizflow.db")
+DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://", "postgresql+psycopg://", 1
+    )
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False}
+    if DATABASE_URL.startswith("sqlite") else {},
     pool_pre_ping=True
 )
-
-# SQLite journal mode helps protect local data during normal app use.
-with engine.connect() as connection:
-    connection.exec_driver_sql("PRAGMA journal_mode=WAL")
-    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine,
-    expire_on_commit=False
+    bind=engine
 )
 
 Base = declarative_base()
 
-# Keep the session key stable between restarts so login sessions work reliably.
-SECRET_FILE = BASE_DIR / ".bizflow_secret"
-if SECRET_FILE.exists():
-    SECRET_KEY = SECRET_FILE.read_text(encoding="utf-8").strip()
-else:
-    SECRET_KEY = ""
+SECRET_KEY = os.getenv("SECRET_KEY")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-if not SECRET_KEY:
-    SECRET_KEY = secrets.token_urlsafe(48)
-    SECRET_FILE.write_text(SECRET_KEY, encoding="utf-8")
-
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "ahmed123"
-LEGACY_ADMIN_PASSWORD = "ChangeThisPassword123!"
+if not SECRET_KEY or not ADMIN_USERNAME or not ADMIN_PASSWORD:
+    if os.getenv("VERCEL"):
+        raise RuntimeError(
+            "Set SECRET_KEY, ADMIN_USERNAME and ADMIN_PASSWORD in Vercel."
+        )
+    SECRET_KEY = SECRET_KEY or secrets.token_urlsafe(32)
+    ADMIN_USERNAME = ADMIN_USERNAME or "admin"
+    ADMIN_PASSWORD = ADMIN_PASSWORD or "ahmed123"
 
 
 # ================= DATABASE MODELS =================
@@ -179,26 +172,19 @@ def verify_password(password, stored):
 def initialize_admin():
     db = SessionLocal()
     try:
-        # Create the initial account only when this is a brand-new database.
-        # If this app was previously run with the old starter password, update
-        # that untouched starter account to the requested password once.
-        user_count = db.query(User).count()
+        user = db.query(User).filter(
+            User.username == ADMIN_USERNAME
+        ).first()
 
-        if user_count == 0:
+        if not user:
             db.add(User(
                 username=ADMIN_USERNAME,
                 password_hash=hash_password(ADMIN_PASSWORD)
             ))
             db.commit()
-        else:
-            starter_user = db.query(User).filter(
-                User.username == ADMIN_USERNAME
-            ).first()
-            if starter_user and verify_password(
-                LEGACY_ADMIN_PASSWORD, starter_user.password_hash
-            ):
-                starter_user.password_hash = hash_password(ADMIN_PASSWORD)
-                db.commit()
+        elif os.getenv("RESET_ADMIN_PASSWORD", "").lower() in {"1", "true", "yes"}:
+            user.password_hash = hash_password(ADMIN_PASSWORD)
+            db.commit()
     finally:
         db.close()
 
@@ -211,14 +197,14 @@ initialize_admin()
 app = FastAPI(
     title="BizFlow 360",
     description="Business Management Platform",
-    version="1.2.0"
+    version="1.0.0"
 )
 
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     same_site="lax",
-    https_only=False
+    https_only=bool(os.getenv("VERCEL"))
 )
 
 app.add_middleware(
@@ -381,21 +367,14 @@ def dashboard(
         Order.created_at.desc()
     ).limit(5).all()
 
-    if IS_SQLITE:
-        month_expression = func.strftime("%Y-%m", Order.created_at)
-    else:
-        month_expression = func.to_char(Order.created_at, "YYYY-MM")
-
     monthly = db.query(
-        month_expression,
+        func.strftime("%Y-%m", Order.created_at),
         func.sum(Order.total)
     ).filter(
         Order.status != "Cancelled"
     ).group_by(
-        month_expression
-    ).order_by(
-        month_expression
-    ).all()
+        func.strftime("%Y-%m", Order.created_at)
+    ).all() if DATABASE_URL.startswith("sqlite") else []
 
     return {
         "customers": customers,
@@ -638,14 +617,12 @@ def update_order_status(
         )
 
     if data.status == "Cancelled" and order.status != "Cancelled":
-        # Return stock only if the order was not already delivered.
-        if order.status != "Delivered":
-            product = db.query(Product).filter(
-                Product.id == order.product_id
-            ).first()
+        product = db.query(Product).filter(
+            Product.id == order.product_id
+        ).first()
 
-            if product:
-                product.stock += order.quantity
+        if product:
+            product.stock += order.quantity
 
     order.status = data.status
     db.commit()
@@ -1026,8 +1003,8 @@ td{padding:15px;font-size:12px;border-bottom:1px solid #202638}
     <div class="card">
         <div class="card-heading"><h3>📊 System Information</h3></div>
         <p class="stat-title">Application: BizFlow 360</p>
-        <p class="stat-title">Version: 1.2.0</p>
-        <p class="stat-title">Database: SQLite (Local Computer)</p>
+        <p class="stat-title">Version: 1.1.0</p>
+        <p class="stat-title">Database: Configured server database</p>
         <p class="stat-title">Total Customers: <b id="sysCustomers">0</b></p>
         <p class="stat-title">Total Products: <b id="sysProducts">0</b></p>
         <p class="stat-title">Total Orders: <b id="sysOrders">0</b></p>
@@ -1209,7 +1186,7 @@ function renderCustomers() {
 function renderProducts() {
     $("productRows").innerHTML=products.length?products.map(p=>`
         <tr><td>${escapeHTML(p.name)}</td><td>${escapeHTML(p.category)}</td>
-        <td>${money(p.price)}</td><td>${p.stock<=Number(currentSettings.low_stock_threshold ?? 5)?`<span style="color:#ff879b">${p.stock} Low stock</span>`:p.stock}</td>
+        <td>${money(p.price)}</td><td>${p.stock<=5?`<span style="color:#ff879b">${p.stock} Low stock</span>`:p.stock}</td>
         <td><div class="actions">
         <button class="btn secondary small" onclick="editProduct(${p.id})">Edit</button>
         <button class="btn danger small" onclick="deleteProduct(${p.id})">Delete</button>
@@ -1254,7 +1231,7 @@ function openModal(type,id=null) {
         product:[
             ["name","Product Name","text"],
             ["category","Category","text"],
-            ["price",`Price (${currentCurrency})`,"number"],
+            ["price","Price (PKR)","number"],
             ["stock","Stock Quantity","number"]
         ]
     };
