@@ -23,34 +23,17 @@ from pydantic import BaseModel, Field
 
 # ================= CONFIGURATION =================
 
+# All application data is stored locally beside this app.py file.
+# No external database, cloud database, or environment DATABASE_URL is used.
 BASE_DIR = Path(__file__).resolve().parent
-IS_VERCEL = os.getenv("VERCEL", "").lower() in {"1", "true"}
+DATABASE_FILE = BASE_DIR / "bizflow.db"
+DATABASE_URL = f"sqlite:///{DATABASE_FILE.as_posix()}"
+IS_SQLITE = True
 
-# Vercel is serverless: SQLite files there are temporary and can disappear.
-# Require a persistent database URL in production instead of silently using /tmp.
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    if IS_VERCEL:
-        raise RuntimeError(
-            "DATABASE_URL is missing. Add your persistent PostgreSQL connection "
-            "string in Vercel Environment Variables. SQLite on Vercel is not persistent."
-        )
-    DATABASE_URL = f"sqlite:///{(BASE_DIR / 'bizflow.db').as_posix()}"
-
-# Support Neon/Render/Supabase PostgreSQL connection-string formats.
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql+psycopg2://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
-
-IS_SQLITE = DATABASE_URL.startswith("sqlite")
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if IS_SQLITE else {},
-    pool_pre_ping=True,
-    pool_recycle=300 if not IS_SQLITE else -1
+    connect_args={"check_same_thread": False},
+    pool_pre_ping=True
 )
 
 SessionLocal = sessionmaker(
@@ -62,19 +45,19 @@ SessionLocal = sessionmaker(
 
 Base = declarative_base()
 
-# Use a stable, random value from the hosting environment in production.
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
-if not SECRET_KEY:
-    if IS_VERCEL:
-        raise RuntimeError("SECRET_KEY is missing. Add a long random SECRET_KEY in Vercel.")
-    SECRET_KEY = secrets.token_urlsafe(48)
+# Keep the session key stable between restarts so login sessions work reliably.
+SECRET_FILE = BASE_DIR / ".bizflow_secret"
+if SECRET_FILE.exists():
+    SECRET_KEY = SECRET_FILE.read_text(encoding="utf-8").strip()
+else:
+    SECRET_KEY = ""
 
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
-if not ADMIN_PASSWORD:
-    if IS_VERCEL:
-        raise RuntimeError("ADMIN_PASSWORD is missing. Set it in Vercel Environment Variables.")
-    ADMIN_PASSWORD = "ChangeThisPassword123!"
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_urlsafe(48)
+    SECRET_FILE.write_text(SECRET_KEY, encoding="utf-8")
+
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "ChangeThisPassword123!"
 
 
 # ================= DATABASE MODELS =================
@@ -218,7 +201,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     same_site="lax",
-    https_only=bool(os.getenv("VERCEL"))
+    https_only=False
 )
 
 app.add_middleware(
@@ -638,12 +621,14 @@ def update_order_status(
         )
 
     if data.status == "Cancelled" and order.status != "Cancelled":
-        product = db.query(Product).filter(
-            Product.id == order.product_id
-        ).first()
+        # Return stock only if the order was not already delivered.
+        if order.status != "Delivered":
+            product = db.query(Product).filter(
+                Product.id == order.product_id
+            ).first()
 
-        if product:
-            product.stock += order.quantity
+            if product:
+                product.stock += order.quantity
 
     order.status = data.status
     db.commit()
@@ -1025,7 +1010,7 @@ td{padding:15px;font-size:12px;border-bottom:1px solid #202638}
         <div class="card-heading"><h3>📊 System Information</h3></div>
         <p class="stat-title">Application: BizFlow 360</p>
         <p class="stat-title">Version: 1.1.0</p>
-        <p class="stat-title">Database: Configured server database</p>
+        <p class="stat-title">Database: SQLite (Local Computer)</p>
         <p class="stat-title">Total Customers: <b id="sysCustomers">0</b></p>
         <p class="stat-title">Total Products: <b id="sysProducts">0</b></p>
         <p class="stat-title">Total Orders: <b id="sysOrders">0</b></p>
@@ -1207,7 +1192,7 @@ function renderCustomers() {
 function renderProducts() {
     $("productRows").innerHTML=products.length?products.map(p=>`
         <tr><td>${escapeHTML(p.name)}</td><td>${escapeHTML(p.category)}</td>
-        <td>${money(p.price)}</td><td>${p.stock<=5?`<span style="color:#ff879b">${p.stock} Low stock</span>`:p.stock}</td>
+        <td>${money(p.price)}</td><td>${p.stock<=Number(currentSettings.low_stock_threshold ?? 5)?`<span style="color:#ff879b">${p.stock} Low stock</span>`:p.stock}</td>
         <td><div class="actions">
         <button class="btn secondary small" onclick="editProduct(${p.id})">Edit</button>
         <button class="btn danger small" onclick="deleteProduct(${p.id})">Delete</button>
@@ -1252,7 +1237,7 @@ function openModal(type,id=null) {
         product:[
             ["name","Product Name","text"],
             ["category","Category","text"],
-            ["price","Price (PKR)","number"],
+            ["price",`Price (${currentCurrency})`,"number"],
             ["stock","Stock Quantity","number"]
         ]
     };
